@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "izy-sensors",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-07",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  // Secrets (not committed): INGEST_TOKEN via `wrangler secret put INGEST_TOKEN`
+  // Local: worker/.dev.vars from `npm run map-env` or copy .dev.vars.example
+  // After: npm run db:create  — paste the printed database_id here, then deploy.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "izy-sensors",
+      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+      "migrations_dir": "migrations"
+    }
+  ]
+}
