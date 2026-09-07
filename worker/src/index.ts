@@ -10,6 +10,7 @@ type NumericField = number | null;
 
 type IngestPayload = {
   device_id?: unknown;
+  zone?: unknown;
   recorded_at?: unknown;
   wifi_rssi?: unknown;
   aht20_temperature_c?: unknown;
@@ -148,8 +149,12 @@ async function ingestReading(request: Request, env: Env): Promise<Response> {
   if (!deviceId || deviceId.length > 64) {
     return json({ error: "invalid_device_id" }, 400);
   }
+  const zone = typeof payload.zone === "string" ? payload.zone.trim() : "classroom";
+  if (!["courtyard", "classroom", "library"].includes(zone)) {
+    return json({ error: "invalid_zone" }, 400);
+  }
 
-  let recordedAt =
+  const recordedAt =
     typeof payload.recorded_at === "string" && payload.recorded_at.length > 0
       ? payload.recorded_at
       : new Date().toISOString();
@@ -160,18 +165,19 @@ async function ingestReading(request: Request, env: Env): Promise<Response> {
   try {
     const inserted = await env.DB.prepare(
       `INSERT INTO readings (
-        device_id, recorded_at, wifi_rssi,
+        device_id, zone, recorded_at, wifi_rssi,
         aht20_temperature_c, aht20_humidity_pct,
         bmp280_temperature_c, bmp280_pressure_hpa, bmp280_altitude_m,
         mq2_adc, mq2_voltage, mq4_adc, mq4_voltage,
         mq6_adc, mq6_voltage, mq135_adc, mq135_voltage,
         sound_adc, sound_voltage, sound_detected,
         uv_adc, uv_voltage, uv_index
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       RETURNING id, recorded_at`,
     )
       .bind(
         deviceId,
+        zone,
         recordedAt,
         optionalInt(payload.wifi_rssi),
         optionalNumber(payload.aht20_temperature_c),

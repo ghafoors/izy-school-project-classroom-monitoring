@@ -48,6 +48,7 @@ const wifiPassword = required(values, "WIFI_PASSWORD");
 const ingestUrl = required(values, "INGEST_URL");
 const ingestToken = required(values, "INGEST_TOKEN");
 const deviceId = required(values, "DEVICE_ID");
+const deviceZone = required(values, "DEVICE_ZONE");
 
 const secretsH = `#pragma once
 
@@ -56,6 +57,7 @@ const secretsH = `#pragma once
 #define INGEST_URL "${escapeCString(ingestUrl)}"
 #define INGEST_TOKEN "${escapeCString(ingestToken)}"
 #define DEVICE_ID "${escapeCString(deviceId)}"
+#define DEVICE_ZONE "${escapeCString(deviceZone)}"
 `;
 
 writeFileSync(join(root, "secrets.h"), secretsH);

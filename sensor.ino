@@ -12,6 +12,10 @@
 #error "Missing secrets.h. Copy secrets.example.h or run: npm run map-env --prefix worker"
 #endif
 
+#ifndef DEVICE_ZONE
+#define DEVICE_ZONE "classroom"
+#endif
+
 // ============================================================================
 // 1. CONFIGURATION & PIN DEFINITIONS
 // ============================================================================
@@ -21,6 +25,7 @@ const char* password = WIFI_PASSWORD;
 const char* ingest_url = INGEST_URL;
 const char* ingest_token = INGEST_TOKEN;
 const char* device_id = DEVICE_ID;  // empty = Wi-Fi MAC
+const char* device_zone = DEVICE_ZONE;
 
 const unsigned long sample_interval_ms = 10000;
 
@@ -264,6 +269,8 @@ void loop() {
 
     String json = "{";
     appendJsonString(json, "device_id", resolved_device_id);
+    json += ',';
+    appendJsonString(json, "zone", String(device_zone));
     json += ',';
     const String ts = isoTimestampUtc();
     if (ts.length() > 0) {

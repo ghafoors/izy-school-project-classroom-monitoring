@@ -6,3 +6,4 @@
 #define INGEST_URL "https://izy-sensors.YOUR_SUBDOMAIN.workers.dev/readings"
 #define INGEST_TOKEN ""
 #define DEVICE_ID ""
+#define DEVICE_ZONE "classroom"
