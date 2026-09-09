@@ -2,7 +2,12 @@
   "name": "izy-local-tools",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
+    "setup": "node scripts/setup.mjs",
+    "start": "node scripts/local-dashboard.mjs",
     "dashboard:local": "node scripts/local-dashboard.mjs"
   },
   "dependencies": {

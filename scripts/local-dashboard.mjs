@@ -1,6 +1,12 @@
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { createServer } from 'node:http'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { SerialPort } from 'serialport'
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
+const IS_WINDOWS = process.platform === 'win32'
+const NPM = IS_WINDOWS ? 'npm.cmd' : 'npm'
 
 const BRIDGE_PORT = Number(process.env.BRIDGE_PORT || 8788)
 const DASHBOARD_PORT = Number(process.env.DASHBOARD_PORT || 8787)
@@ -56,20 +62,57 @@ function consumeSerial(chunk) {
   }
 }
 
+function portHaystack(port) {
+  return [port.path, port.manufacturer, port.friendlyName, port.pnpId, port.vendorId]
+    .filter(Boolean)
+    .join(' ')
+}
+
+function isLikelySensorPort(port) {
+  const hay = portHaystack(port)
+  if (/bluetooth|debug-console|incoming/i.test(hay)) return false
+  return /usbserial|usbmodem|cp210|silicon labs|ch340|wch|ftdi|10c4|1a86|0403|303a/i.test(hay)
+}
+
+function looksLikeComPort(port) {
+  return /^COM\d+$/i.test(port.path)
+}
+
 async function chooseSerialPort() {
   if (serialPath) return serialPath
   const ports = await SerialPort.list()
-  const candidate = ports.find(
-    (port) =>
-      /usbserial|usbmodem/i.test(port.path) ||
-      /cp210|silicon labs/i.test(`${port.manufacturer || ''} ${port.friendlyName || ''}`),
+  const comPorts = ports.filter(
+    (port) => looksLikeComPort(port) && !/bluetooth/i.test(portHaystack(port)),
   )
+  const candidate = ports.find(isLikelySensorPort) || (comPorts.length === 1 ? comPorts[0] : undefined)
   if (!candidate) {
-    throw new Error(
-      'No USB serial device found. Set SERIAL_PORT=/dev/cu.usbserial-XXXX and retry.',
-    )
+    const hint = IS_WINDOWS
+      ? 'Set SERIAL_PORT=COM3 (Device Manager → Ports) and retry.'
+      : 'Set SERIAL_PORT=/dev/cu.usbserial-XXXX and retry.'
+    throw new Error(`No USB serial device found. ${hint}`)
   }
   return candidate.path
+}
+
+function openBrowser(url) {
+  if (IS_WINDOWS) {
+    spawn('cmd', ['/c', 'start', '', url], { stdio: 'ignore', detached: true, windowsHide: true }).unref()
+    return
+  }
+  if (process.platform === 'darwin') {
+    spawn('open', [url], { stdio: 'ignore', detached: true }).unref()
+    return
+  }
+  spawn('xdg-open', [url], { stdio: 'ignore', detached: true }).unref()
+}
+
+function stopChild(child) {
+  if (!child?.pid) return
+  if (IS_WINDOWS) {
+    spawnSync('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true })
+    return
+  }
+  if (!child.killed) child.kill('SIGTERM')
 }
 
 async function connectSerial() {
@@ -90,6 +133,31 @@ async function connectSerial() {
   }
 }
 
+const ZONE_META = {
+  courtyard: {
+    id: 'courtyard',
+    label: 'Courtyard (Outdoor)',
+    short: 'Courtyard',
+    kind: 'outdoor',
+  },
+  classroom: {
+    id: 'classroom',
+    label: 'Grade 4 Classroom',
+    short: 'Classroom',
+    kind: 'indoor',
+  },
+  library: {
+    id: 'library',
+    label: 'School Library',
+    short: 'Library',
+    kind: 'indoor',
+  },
+}
+
+function resolveZone(raw) {
+  return ZONE_META[raw] || ZONE_META.classroom
+}
+
 function statusForClimate(temperatureC, humidityPct) {
   if (temperatureC >= 32 || humidityPct >= 85) return ['watch', 'Hot / Humid']
   if (temperatureC >= 29 && humidityPct >= 70) return ['watch', 'Tropical Warm']
@@ -104,16 +172,12 @@ function buildPayload() {
   const hasClimate = hasReading && Number.isFinite(temperatureC) && Number.isFinite(humidityPct)
   const [climateStatus, climateLabel] = statusForClimate(temperatureC, humidityPct)
   const updatedAt = latest?.recorded_at || new Date().toISOString()
+  const zone = resolveZone(latest?.zone)
 
   return {
-    zone: {
-      id: 'classroom',
-      label: 'Grade 4 Classroom',
-      short: 'Classroom',
-      kind: 'indoor',
-    },
+    zone,
     telemetry: {
-      zone: 'classroom',
+      zone: zone.id,
       uvIndex: latest?.uv_index ?? 0,
       co2Ppm:
         latest?.mq135_adc == null
@@ -149,8 +213,8 @@ function buildPayload() {
     hourly: [],
     snapshots: [
       {
-        zone: 'classroom',
-        label: 'Grade 4 Classroom',
+        zone: zone.id,
+        label: zone.label,
         uvIndex: latest?.uv_index ?? 0,
         co2Ppm: 0,
         temperatureC,
@@ -237,24 +301,25 @@ const bridge = createServer((request, response) => {
 bridge.listen(BRIDGE_PORT, '127.0.0.1', () => {
   console.log(`[bridge] Listening at http://127.0.0.1:${BRIDGE_PORT}`)
   dashboard = spawn(
-    'npm',
+    NPM,
     ['run', 'dev', '--prefix', 'semp', '--', '--port', String(DASHBOARD_PORT)],
-    { stdio: 'inherit' },
+    { cwd: ROOT, stdio: 'inherit', shell: IS_WINDOWS, env: process.env },
   )
   dashboard.on('error', (error) => console.error('[dashboard]', error.message))
 
   setTimeout(() => {
     const url = `http://127.0.0.1:${DASHBOARD_PORT}/?zone=classroom&mode=local`
     console.log(`[dashboard] Opening ${url}`)
-    spawn('open', [url], { stdio: 'ignore', detached: true }).unref()
-  }, 2500)
+    openBrowser(url)
+  }, 3500)
 })
 
 void connectSerial()
 
 function shutdown() {
   if (serial?.isOpen) serial.close()
-  if (dashboard && !dashboard.killed) dashboard.kill('SIGTERM')
+  stopChild(dashboard)
+  dashboard = undefined
   bridge.close(() => process.exit(0))
   setTimeout(() => process.exit(0), 1000).unref()
 }

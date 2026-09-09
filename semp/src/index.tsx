@@ -155,6 +155,11 @@ const ZONE_BASELINES: Record<
 
 const TREND_POINTS = 12
 const POLL_MS = 3000
+const LOCAL_POLL_MS = 3000
+
+function pollMsForMode(mode: DataMode): number {
+  return mode === 'local' ? LOCAL_POLL_MS : POLL_MS
+}
 
 const STATUS_STROKE: Record<MetricStatus, string> = {
   good: '#2dd4bf',
@@ -555,7 +560,21 @@ async function buildDashboardPayload(
   const snapshots =
     mode === 'simulated'
       ? generateAllZoneSnapshots()
-      : ZONES.map((snapshotZone) => ({
+      : mode === 'local'
+        ? [
+            {
+              zone: zone.id,
+              label: zone.label,
+              uvIndex: 0,
+              co2Ppm: 0,
+              temperatureC: 0,
+              humidityPct: 0,
+              noiseDb: 0,
+              status: 'good' as const,
+              statusLabel: 'Waiting for USB',
+            },
+          ]
+        : ZONES.map((snapshotZone) => ({
           zone: snapshotZone.id,
           label: snapshotZone.label,
           uvIndex: 0,
@@ -611,8 +630,11 @@ async function buildDashboardPayload(
     source === 'no-data'
       ? {
           level: 'good' as const,
-          title: 'Waiting for actual sensor data',
-          message: `No D1 readings exist for ${zone.label} yet. Switch to Simulated to preview the dashboard.`,
+          title: mode === 'local' ? 'Waiting for USB sensor data' : 'Waiting for actual sensor data',
+          message:
+            mode === 'local'
+              ? `Only the connected USB node (${zone.label}) is shown in Local USB mode.`
+              : `No D1 readings exist for ${zone.label} yet. Switch to Simulated to preview the dashboard.`,
         }
       : buildAdvisory(telemetry, zone)
 
@@ -1039,6 +1061,7 @@ const ZoneTable: FC<{ rows: ZoneSnapshot[]; active: ZoneId }> = ({ rows, active 
 const clientScript = `
 (function () {
   var POLL_MS = ${POLL_MS};
+  var LOCAL_POLL_MS = ${LOCAL_POLL_MS};
   var TREND_POINTS = ${TREND_POINTS};
   var STATUS_STROKE = { good: '#2dd4bf', watch: '#fbbf24', alert: '#fb7185' };
   var BADGE = {
@@ -1068,6 +1091,7 @@ const clientScript = `
   var currentZone = document.body.getAttribute('data-zone') || 'courtyard';
   var currentMode = document.body.getAttribute('data-mode') || 'actual';
   var pollTimer = null;
+  var scheduledMs = 0;
   var fetching = false;
 
   function sparkGeom(values, w, h) {
@@ -1251,27 +1275,20 @@ const clientScript = `
   }
 
   function updateZoneTable(rows, active) {
-    rows.forEach(function (row) {
-      var tr = document.querySelector('[data-zone-row="' + row.zone + '"]');
-      if (!tr) return;
+    var tbody = document.querySelector('[data-zone-tbody]');
+    if (!tbody) return;
+    tbody.innerHTML = (rows || []).map(function (row) {
       var isActive = row.zone === active;
-      tr.className = 'border-b border-white/5 ' + (isActive ? 'bg-teal-500/5' : 'hover:bg-white/[0.02]');
-      var dot = tr.querySelector('[data-zone-dot]');
-      if (dot) dot.className = 'inline-block h-1.5 w-1.5 rounded-full ' + (isActive ? 'bg-teal-400' : 'bg-slate-600');
-      var uv = tr.querySelector('[data-zone-uv]');
-      var co2 = tr.querySelector('[data-zone-co2]');
-      var climate = tr.querySelector('[data-zone-climate]');
-      var noise = tr.querySelector('[data-zone-noise]');
-      var status = tr.querySelector('[data-zone-status]');
-      if (uv) uv.textContent = row.uvIndex.toFixed(1);
-      if (co2) co2.textContent = row.co2Ppm + '/100';
-      if (climate) climate.textContent = row.temperatureC.toFixed(1) + '°C / ' + row.humidityPct + '%';
-      if (noise) noise.textContent = row.noiseDb + '%';
-      if (status) {
-        status.className = 'inline-flex rounded-md px-2 py-0.5 text-[10px] font-semibold ' + (PILL[row.status] || PILL.good);
-        status.textContent = row.statusLabel;
-      }
-    });
+      var pill = PILL[row.status] || PILL.good;
+      return '<tr data-zone-row="' + escapeHtml(row.zone) + '" class="border-b border-white/5 ' + (isActive ? 'bg-teal-500/5' : 'hover:bg-white/[0.02]') + '">' +
+        '<td class="py-2 pr-2 font-medium text-slate-100"><span class="inline-flex items-center gap-2"><span data-zone-dot class="inline-block h-1.5 w-1.5 rounded-full ' + (isActive ? 'bg-teal-400' : 'bg-slate-600') + '"></span>' + escapeHtml(row.label) + '</span></td>' +
+        '<td data-zone-uv class="py-2 pr-2 tabular-nums text-slate-300">' + row.uvIndex.toFixed(1) + '</td>' +
+        '<td data-zone-co2 class="py-2 pr-2 tabular-nums text-slate-300">' + row.co2Ppm + '/100</td>' +
+        '<td data-zone-climate class="py-2 pr-2 tabular-nums text-slate-300">' + row.temperatureC.toFixed(1) + '°C / ' + row.humidityPct + '%</td>' +
+        '<td data-zone-noise class="py-2 pr-2 tabular-nums text-slate-300">' + row.noiseDb + '%</td>' +
+        '<td class="py-2"><span data-zone-status class="inline-flex rounded-md px-2 py-0.5 text-[10px] font-semibold ' + pill + '">' + escapeHtml(row.statusLabel) + '</span></td>' +
+        '</tr>';
+    }).join('');
   }
 
   function updateAdvisory(advisory, zoneLabel) {
@@ -1297,15 +1314,26 @@ const clientScript = `
     if (msgEl) msgEl.textContent = advisory.message;
   }
 
-  function setZoneTabs(active) {
-    document.querySelectorAll('[data-zone-tab]').forEach(function (btn) {
-      var id = btn.getAttribute('data-zone-tab');
-      var on = id === active;
-      btn.className = on
+  function escapeHtml(value) {
+    return String(value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function setZoneTabs(rows, active) {
+    var nav = document.querySelector('[data-zone-nav]');
+    if (!nav) return;
+    nav.hidden = !rows || rows.length < 2;
+    nav.innerHTML = (rows || []).map(function (row) {
+      var on = row.zone === active;
+      var cls = on
         ? 'rounded-lg bg-teal-400 px-3 py-1.5 text-xs font-semibold text-slate-950 shadow-lg shadow-teal-500/20'
         : 'rounded-lg bg-slate-900/60 px-3 py-1.5 text-xs font-medium text-slate-300 ring-1 ring-white/10 hover:bg-slate-800/80 hover:text-white';
-      btn.setAttribute('aria-pressed', on ? 'true' : 'false');
-    });
+      return '<button type="button" data-zone-tab="' + escapeHtml(row.zone) + '" aria-pressed="' + (on ? 'true' : 'false') + '" class="' + cls + '">' +
+        escapeHtml(row.label) + '</button>';
+    }).join('');
   }
 
   function applyPayload(data, resetHistory) {
@@ -1320,7 +1348,11 @@ const clientScript = `
     }
 
     var updated = document.querySelector('[data-updated-at]');
-    if (updated) updated.textContent = 'Updated ' + data.updatedAtFormatted + ' MVT · ' + data.source + ' · ' + (POLL_MS / 1000) + 's';
+    var refreshMs = currentMode === 'local' ? LOCAL_POLL_MS : POLL_MS;
+    if (updated) updated.textContent = 'Updated ' + data.updatedAtFormatted + ' MVT · ' + data.source + ' · ' + (refreshMs / 1000) + 's';
+    var footerRefresh = document.querySelector('[data-refresh-interval]');
+    if (footerRefresh) footerRefresh.textContent = String(refreshMs / 1000);
+    schedule();
 
     var zoneShort = document.querySelector('[data-zone-short]');
     if (zoneShort) zoneShort.textContent = 'Five school hours · ' + data.zone.short + ' · live edge telemetry';
@@ -1328,7 +1360,13 @@ const clientScript = `
     var footerZone = document.querySelector('[data-footer-zone]');
     if (footerZone) footerZone.textContent = data.zone.id;
 
-    setZoneTabs(currentZone);
+    setZoneTabs(data.snapshots, currentZone);
+    var compareCopy = document.querySelector('[data-zone-compare-copy]');
+    if (compareCopy) {
+      compareCopy.textContent = currentMode === 'local'
+        ? 'Connected USB sensor only'
+        : 'Live status across all school locations';
+    }
     document.querySelectorAll('[data-mode-switch]').forEach(function (btn) {
       var active = btn.getAttribute('data-mode-switch') === currentMode;
       btn.className = active
@@ -1403,14 +1441,20 @@ const clientScript = `
   }
 
   function schedule() {
+    var ms = currentMode === 'local' ? LOCAL_POLL_MS : POLL_MS;
+    if (pollTimer && scheduledMs === ms) return;
     if (pollTimer) clearInterval(pollTimer);
+    scheduledMs = ms;
     pollTimer = setInterval(function () {
       fetchPayload(currentZone, false);
-    }, POLL_MS);
+    }, ms);
   }
 
-  document.querySelectorAll('[data-zone-tab]').forEach(function (btn) {
-    btn.addEventListener('click', function () {
+  var zoneNav = document.querySelector('[data-zone-nav]');
+  if (zoneNav) {
+    zoneNav.addEventListener('click', function (event) {
+      var btn = event.target.closest('[data-zone-tab]');
+      if (!btn || !zoneNav.contains(btn)) return;
       var zone = btn.getAttribute('data-zone-tab');
       if (!zone || zone === currentZone) return;
       var url = new URL(window.location.href);
@@ -1418,7 +1462,7 @@ const clientScript = `
       history.pushState({ zone: zone }, '', url);
       fetchPayload(zone, true);
     });
-  });
+  }
 
   document.querySelectorAll('[data-mode-switch]').forEach(function (btn) {
     btn.addEventListener('click', function () {
@@ -1600,19 +1644,23 @@ const Dashboard: FC<{ data: DashboardPayload }> = ({ data }) => {
                       : 'Actual Data — Cloudflare D1'}
                 </div>
                 <p data-updated-at class="text-[11px] text-slate-500">
-                  Updated {data.updatedAtFormatted} MVT · {data.source} · {POLL_MS / 1000}s
+                  Updated {data.updatedAtFormatted} MVT · {data.source} · {pollMsForMode(data.mode) / 1000}s
                 </p>
               </div>
             </header>
 
             <div class="flex min-w-0 flex-wrap items-center gap-2">
-              <nav class="flex flex-wrap gap-1.5" aria-label="Location switcher">
-                {ZONES.map((z) => {
-                  const active = z.id === zone.id
+              <nav
+                class={`flex flex-wrap gap-1.5${snapshots.length < 2 ? ' hidden' : ''}`}
+                aria-label="Location switcher"
+                data-zone-nav
+              >
+                {snapshots.map((z) => {
+                  const active = z.zone === zone.id
                   return (
                     <button
                       type="button"
-                      data-zone-tab={z.id}
+                      data-zone-tab={z.zone}
                       aria-pressed={active ? 'true' : 'false'}
                       class={
                         active
@@ -1736,7 +1784,11 @@ const Dashboard: FC<{ data: DashboardPayload }> = ({ data }) => {
               <div class="flex min-h-0 flex-col rounded-xl bg-slate-900/70 p-3 ring-1 ring-white/10 backdrop-blur-sm">
                 <div class="mb-2 shrink-0">
                   <h3 class="font-display text-sm font-semibold text-white">Zone Comparison</h3>
-                  <p class="text-[11px] text-slate-400">Live status across all school locations</p>
+                  <p data-zone-compare-copy class="text-[11px] text-slate-400">
+                    {data.mode === 'local'
+                      ? 'Connected USB sensor only'
+                      : 'Live status across all school locations'}
+                  </p>
                 </div>
                 <ZoneTable rows={snapshots} active={zone.id} />
               </div>
@@ -1747,7 +1799,7 @@ const Dashboard: FC<{ data: DashboardPayload }> = ({ data }) => {
                 EcoSchool Sense PoC · Hono on Cloudflare Workers · live JSON poll
               </p>
               <p class="shrink-0 tabular-nums">
-                Soft refresh {POLL_MS / 1000}s · Zone:{' '}
+                Soft refresh <span data-refresh-interval>{pollMsForMode(data.mode) / 1000}</span>s · Zone:{' '}
                 <span data-footer-zone>{zone.id}</span>
               </p>
             </footer>
