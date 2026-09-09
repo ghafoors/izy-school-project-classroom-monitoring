@@ -10,7 +10,7 @@
     {
       "binding": "DB",
       "database_name": "izy-sensors",
-      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+      "database_id": "29f1da56-39f6-430f-b359-704d9b2d0610",
       "migrations_dir": "../worker/migrations"
     }
   ]

@@ -10,12 +10,11 @@
   },
   // Secrets (not committed): INGEST_TOKEN via `wrangler secret put INGEST_TOKEN`
   // Local: worker/.dev.vars from `npm run map-env` or copy .dev.vars.example
-  // After: npm run db:create  — paste the printed database_id here, then deploy.
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "izy-sensors",
-      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+      "database_id": "29f1da56-39f6-430f-b359-704d9b2d0610",
       "migrations_dir": "migrations"
     }
   ]

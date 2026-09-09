@@ -1,0 +1,11 @@
+{
+  "name": "izy-local-tools",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dashboard:local": "node scripts/local-dashboard.mjs"
+  },
+  "dependencies": {
+    "serialport": "^13.0.0"
+  }
+}

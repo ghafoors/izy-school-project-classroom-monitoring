@@ -27,7 +27,7 @@ const char* ingest_token = INGEST_TOKEN;
 const char* device_id = DEVICE_ID;  // empty = Wi-Fi MAC
 const char* device_zone = DEVICE_ZONE;
 
-const unsigned long sample_interval_ms = 10000;
+const unsigned long sample_interval_ms = 3000;
 
 #define I2C_SDA 21
 #define I2C_SCL 22
@@ -113,6 +113,13 @@ bool readAnalog(int pin, int& adc, float& voltage) {
   return true;
 }
 
+String hardwareDeviceId() {
+  const uint64_t id = ESP.getEfuseMac();
+  char value[20];
+  snprintf(value, sizeof(value), "esp32-%04X%08X", (uint16_t)(id >> 32), (uint32_t)id);
+  return String(value);
+}
+
 String isoTimestampUtc() {
   time_t now = time(nullptr);
   if (now < 1700000000) {
@@ -191,20 +198,27 @@ void setup() {
     Serial.println("[WARNING] BMP280 sensor not found on I2C bus!");
   }
 
+  WiFi.mode(WIFI_STA);
+  resolved_device_id = strlen(device_id) > 0 ? String(device_id) : hardwareDeviceId();
+  Serial.print("Device ID: ");
+  Serial.println(resolved_device_id);
+
+  WiFi.setAutoReconnect(true);
   WiFi.begin(ssid, password);
   Serial.print("Connecting to Wi-Fi");
-  while (WiFi.status() != WL_CONNECTED) {
+  const unsigned long wifi_started = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifi_started < 10000) {
     delay(500);
     Serial.print(".");
   }
 
-  Serial.println("\n[SUCCESS] Wi-Fi connected!");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
-
-  resolved_device_id = strlen(device_id) > 0 ? String(device_id) : WiFi.macAddress();
-  Serial.print("Device ID: ");
-  Serial.println(resolved_device_id);
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[SUCCESS] Wi-Fi connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\n[WARN] Wi-Fi unavailable; continuing with USB serial data.");
+  }
 
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 }
@@ -320,6 +334,8 @@ void loop() {
     appendJsonOptionalFloat(json, "uv_index", enable_uv, uv_index, 2);
     json += '}';
 
+    Serial.print("[DATA] ");
+    Serial.println(json);
     postReading(json);
   }
 

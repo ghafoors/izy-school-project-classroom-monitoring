@@ -22,6 +22,7 @@ type Telemetry = {
   co2Ppm: number
   temperatureC: number
   humidityPct: number
+  pressureHpa: number | null
   noiseDb: number
   updatedAt: string
 }
@@ -53,6 +54,13 @@ type MetricMeta = {
   subtitle: string
 }
 
+type PressureInfo = {
+  label: string
+  severity: string
+  color: string
+  description: string
+}
+
 type MetricTrends = {
   uvIndex: number[]
   co2Ppm: number[]
@@ -61,13 +69,21 @@ type MetricTrends = {
   noiseDb: number[]
 }
 
-type DataMode = 'actual' | 'simulated'
+type DataMode = 'actual' | 'local' | 'simulated'
 
 type DashboardPayload = {
   zone: ZoneMeta
   telemetry: Telemetry
   mode: DataMode
-  source: 'live' | 'live-partial' | 'simulated' | 'no-data'
+  source: 'live' | 'live-partial' | 'local-usb' | 'simulated' | 'no-data'
+  available?: {
+    uv: boolean
+    air: boolean
+    climate: boolean
+    noise: boolean
+    pressure?: boolean
+    altitude?: boolean
+  }
   trends: MetricTrends
   hourly: HourlyCo2[]
   snapshots: ZoneSnapshot[]
@@ -88,6 +104,7 @@ type ReadingRow = {
   aht20_temperature_c: number | null
   aht20_humidity_pct: number | null
   bmp280_temperature_c: number | null
+  bmp280_pressure_hpa: number | null
   mq135_adc: number | null
   sound_adc: number | null
   uv_index: number | null
@@ -137,7 +154,7 @@ const ZONE_BASELINES: Record<
 }
 
 const TREND_POINTS = 12
-const POLL_MS = 8000
+const POLL_MS = 3000
 
 const STATUS_STROKE: Record<MetricStatus, string> = {
   good: '#2dd4bf',
@@ -171,6 +188,7 @@ function generateMockTelemetry(zone: ZoneId): Telemetry {
     co2Ppm: Math.round(clamp(jitter(base.co2Ppm, isOutdoor ? 4 : 8, 0), 0, 100)),
     temperatureC: clamp(jitter(base.temperatureC, 0.8, 1), 22, 36),
     humidityPct: Math.round(clamp(jitter(base.humidityPct, 4, 0), 40, 95)),
+    pressureHpa: jitter(1012, 2, 1),
     noiseDb: Math.round(clamp(jitter(base.noiseDb, 8, 0), 0, 100)),
     updatedAt: new Date().toISOString(),
   }
@@ -226,6 +244,50 @@ function climateLabel(temp: number, humidity: number): { label: string; status: 
     return { label: 'Tropical Comfort', status: 'good' }
   }
   return { label: 'Stable', status: 'good' }
+}
+
+function absolutePressureInfo(pressureHpa: number | null): PressureInfo | null {
+  if (pressureHpa === null || !Number.isFinite(pressureHpa)) return null
+  if (pressureHpa < 990) {
+    return {
+      label: 'Very Low',
+      severity: 'Warning',
+      color: '#FF3B30',
+      description:
+        'Major low-pressure system or severe storm nearby. Heavy rain and high winds may occur.',
+    }
+  }
+  if (pressureHpa < 1009) {
+    return {
+      label: 'Low',
+      severity: 'Caution',
+      color: '#FFCC00',
+      description: 'Unsettled weather, cloud cover, or rain is likely.',
+    }
+  }
+  if (pressureHpa < 1021) {
+    return {
+      label: 'Normal',
+      severity: 'Optimal',
+      color: '#34C759',
+      description: 'Stable or fair weather near the 1013.25 hPa sea-level baseline.',
+    }
+  }
+  if (pressureHpa <= 1030) {
+    return {
+      label: 'High',
+      severity: 'Info',
+      color: '#007AFF',
+      description: 'Fair weather, clear skies, dry air, and high atmospheric stability.',
+    }
+  }
+  return {
+    label: 'Very High',
+    severity: 'Notice',
+    color: '#AF52DE',
+    description:
+      'Strong anticyclone with unusually dry air or a possible temperature inversion.',
+  }
 }
 
 function noiseLabel(activity: number): { label: string; status: MetricStatus } {
@@ -327,6 +389,7 @@ function parseZone(raw: string | undefined | null): ZoneId {
 }
 
 function parseMode(raw: string | undefined | null): DataMode {
+  if (raw === 'local') return 'local'
   return raw === 'simulated' ? 'simulated' : 'actual'
 }
 
@@ -363,6 +426,7 @@ function readingToTelemetry(row: ReadingRow, zoneId: ZoneId): Telemetry {
     temperatureC:
       row.aht20_temperature_c ?? row.bmp280_temperature_c ?? fallback.temperatureC,
     humidityPct: row.aht20_humidity_pct ?? fallback.humidityPct,
+    pressureHpa: row.bmp280_pressure_hpa,
     noiseDb: row.sound_adc === null ? fallback.noiseDb : adcToSoundActivity(row.sound_adc),
     updatedAt: row.recorded_at,
   }
@@ -396,6 +460,7 @@ async function getZoneReadings(db: D1Database, zoneId: ZoneId): Promise<ReadingR
     .prepare(
       `SELECT device_id, zone, recorded_at,
         aht20_temperature_c, aht20_humidity_pct, bmp280_temperature_c,
+        bmp280_pressure_hpa,
         mq135_adc, sound_adc, uv_index
        FROM readings
        WHERE zone = ?
@@ -426,6 +491,7 @@ async function buildDashboardPayload(
             co2Ppm: 0,
             temperatureC: 0,
             humidityPct: 0,
+            pressureHpa: null,
             noiseDb: 0,
             updatedAt: new Date().toISOString(),
           }
@@ -749,7 +815,8 @@ const MetricCard: FC<{
   icon: Child
   trend: number[]
   trendLabel: string
-}> = ({ id, title, value, unit, subtitle, badge, status, icon, trend, trendLabel }) => {
+  detail?: Child
+}> = ({ id, title, value, unit, subtitle, badge, status, icon, trend, trendLabel, detail }) => {
   const tone = statusTone(status)
   return (
     <article
@@ -787,8 +854,43 @@ const MetricCard: FC<{
       <p data-metric-subtitle class={`mt-0.5 truncate text-xs font-medium ${tone.text}`}>
         {subtitle}
       </p>
+      {detail}
       <Sparkline id={id} values={trend} status={status} label={trendLabel} />
     </article>
+  )
+}
+
+const PressureSummary: FC<{ pressureHpa: number | null }> = ({ pressureHpa }) => {
+  const info = absolutePressureInfo(pressureHpa)
+  return (
+    <div
+      data-pressure-summary
+      class="mt-1.5 rounded-lg border border-white/10 bg-black/20 px-2 py-1.5"
+      hidden={info === null}
+    >
+      <div class="flex items-center justify-between gap-2">
+        <p class="text-lg font-semibold leading-none text-white tabular-nums">
+          <span data-pressure-value>
+            {pressureHpa === null ? '—' : pressureHpa.toFixed(1)}
+          </span>{' '}
+          <span class="text-[10px] font-medium text-slate-400">hPa</span>
+        </p>
+        <span
+          data-pressure-label
+          class="rounded-md border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide"
+          style={
+            info
+              ? `color:${info.color};border-color:${info.color}66;background:${info.color}18`
+              : ''
+          }
+        >
+          {info?.label ?? ''}
+        </span>
+      </div>
+      <p data-pressure-description class="mt-1 line-clamp-2 text-[10px] leading-tight text-slate-400">
+        {info ? `${info.severity} · ${info.description}` : ''}
+      </p>
+    </div>
   )
 }
 
@@ -999,6 +1101,49 @@ const clientScript = `
     el.classList.add('value-flash');
   }
 
+  function pressureInfo(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+    if (value < 990) return {
+      label: 'Very Low', severity: 'Warning', color: '#FF3B30',
+      description: 'Major low-pressure system or severe storm nearby. Heavy rain and high winds may occur.'
+    };
+    if (value < 1009) return {
+      label: 'Low', severity: 'Caution', color: '#FFCC00',
+      description: 'Unsettled weather, cloud cover, or rain is likely.'
+    };
+    if (value < 1021) return {
+      label: 'Normal', severity: 'Optimal', color: '#34C759',
+      description: 'Stable or fair weather near the 1013.25 hPa sea-level baseline.'
+    };
+    if (value <= 1030) return {
+      label: 'High', severity: 'Info', color: '#007AFF',
+      description: 'Fair weather, clear skies, dry air, and high atmospheric stability.'
+    };
+    return {
+      label: 'Very High', severity: 'Notice', color: '#AF52DE',
+      description: 'Strong anticyclone with unusually dry air or a possible temperature inversion.'
+    };
+  }
+
+  function updatePressure(value) {
+    var summary = document.querySelector('[data-pressure-summary]');
+    if (!summary) return;
+    var info = pressureInfo(value);
+    summary.hidden = !info;
+    if (!info) return;
+    var valueEl = summary.querySelector('[data-pressure-value]');
+    var labelEl = summary.querySelector('[data-pressure-label]');
+    var descriptionEl = summary.querySelector('[data-pressure-description]');
+    if (valueEl) valueEl.textContent = value.toFixed(1);
+    if (labelEl) {
+      labelEl.textContent = info.label;
+      labelEl.style.color = info.color;
+      labelEl.style.borderColor = info.color + '66';
+      labelEl.style.backgroundColor = info.color + '18';
+    }
+    if (descriptionEl) descriptionEl.textContent = info.severity + ' · ' + info.description;
+  }
+
   function setSpark(id, values, status) {
     var svg = document.querySelector('[data-sparkline="' + id + '"]');
     if (!svg) return;
@@ -1194,19 +1339,27 @@ const clientScript = `
     updateAdvisory(data.advisory, data.zone.label);
 
     var noData = data.source === 'no-data';
-    updateMetricCard('uv', noData ? '—' : data.telemetry.uvIndex.toFixed(1), '', data.metrics.uv, 'uvIndex', data.telemetry.uvIndex, append && !noData);
-    updateMetricCard('co2', noData ? '—' : String(data.telemetry.co2Ppm), noData ? '' : '/100', data.metrics.co2, 'co2Ppm', data.telemetry.co2Ppm, append && !noData);
+    var available = data.available || { uv: true, air: true, climate: true, noise: true };
+    var hasUv = !noData && available.uv;
+    var hasAir = !noData && available.air;
+    var hasClimate = !noData && available.climate;
+    var hasNoise = !noData && available.noise;
+    updateMetricCard('uv', hasUv ? data.telemetry.uvIndex.toFixed(1) : '—', '', data.metrics.uv, 'uvIndex', data.telemetry.uvIndex, append && hasUv);
+    updateMetricCard('co2', hasAir ? String(data.telemetry.co2Ppm) : '—', hasAir ? '/100' : '', data.metrics.co2, 'co2Ppm', data.telemetry.co2Ppm, append && hasAir);
     updateMetricCard(
       'climate',
-      noData ? '—' : data.telemetry.temperatureC.toFixed(1) + '°C',
-      noData ? '' : '/ ' + data.telemetry.humidityPct + '%',
+      hasClimate ? data.telemetry.temperatureC.toFixed(1) + '°C' : '—',
+      hasClimate ? '/ ' + data.telemetry.humidityPct + '%' : '',
       data.metrics.climate,
       'temperatureC',
       data.telemetry.temperatureC,
-      append && !noData
+      append && hasClimate
     );
-    if (append && !noData) pushHistory('humidityPct', data.telemetry.humidityPct);
-    updateMetricCard('noise', noData ? '—' : String(data.telemetry.noiseDb), noData ? '' : '%', data.metrics.noise, 'noiseDb', data.telemetry.noiseDb, append && !noData);
+    if (append && hasClimate) pushHistory('humidityPct', data.telemetry.humidityPct);
+    updatePressure(
+      !noData && available.pressure !== false ? data.telemetry.pressureHpa : null
+    );
+    updateMetricCard('noise', hasNoise ? String(data.telemetry.noiseDb) : '—', hasNoise ? '%' : '', data.metrics.noise, 'noiseDb', data.telemetry.noiseDb, append && hasNoise);
 
     updateCo2Chart(data.hourly);
     updateZoneTable(data.snapshots, currentZone);
@@ -1215,8 +1368,12 @@ const clientScript = `
     if (live) {
       live.lastChild.textContent = data.source === 'simulated'
         ? 'Simulated Data'
+        : data.source === 'local-usb'
+          ? 'Live Data — Local USB'
         : data.source === 'no-data'
-          ? 'Actual Data — Waiting for readings'
+          ? currentMode === 'local'
+            ? 'Local USB — Waiting for readings'
+            : 'Actual Data — Waiting for readings'
           : 'Actual Data — Cloudflare D1';
       live.classList.remove('live-tick');
       void live.offsetWidth;
@@ -1228,7 +1385,10 @@ const clientScript = `
     if (fetching) return;
     fetching = true;
     try {
-      var res = await fetch('/api/telemetry?zone=' + encodeURIComponent(zone) + '&mode=' + encodeURIComponent(currentMode), {
+      var endpoint = currentMode === 'local'
+        ? 'http://127.0.0.1:8788/api/telemetry'
+        : '/api/telemetry?zone=' + encodeURIComponent(zone) + '&mode=' + encodeURIComponent(currentMode);
+      var res = await fetch(endpoint, {
         headers: { Accept: 'application/json' },
         cache: 'no-store'
       });
@@ -1275,7 +1435,8 @@ const clientScript = `
   window.addEventListener('popstate', function () {
     var url = new URL(window.location.href);
     var zone = url.searchParams.get('zone') || 'courtyard';
-    currentMode = url.searchParams.get('mode') === 'simulated' ? 'simulated' : 'actual';
+    var mode = url.searchParams.get('mode');
+    currentMode = mode === 'simulated' ? 'simulated' : mode === 'local' ? 'local' : 'actual';
     fetchPayload(zone, true);
   });
 
@@ -1404,7 +1565,7 @@ const Dashboard: FC<{ data: DashboardPayload }> = ({ data }) => {
 
               <div class="flex flex-wrap items-center gap-2">
                 <div class="inline-flex rounded-lg bg-slate-900/70 p-0.5 ring-1 ring-white/10" aria-label="Data source">
-                  {(['actual', 'simulated'] as const).map((mode) => (
+                  {(['actual', 'local', 'simulated'] as const).map((mode) => (
                     <button
                       type="button"
                       data-mode-switch={mode}
@@ -1415,7 +1576,11 @@ const Dashboard: FC<{ data: DashboardPayload }> = ({ data }) => {
                           : 'rounded-md px-2.5 py-1 text-[11px] font-medium text-slate-400 hover:text-white'
                       }
                     >
-                      {mode === 'actual' ? 'Actual D1' : 'Simulated'}
+                      {mode === 'actual'
+                        ? 'Actual D1'
+                        : mode === 'local'
+                          ? 'Local USB'
+                          : 'Simulated'}
                     </button>
                   ))}
                 </div>
@@ -1426,8 +1591,12 @@ const Dashboard: FC<{ data: DashboardPayload }> = ({ data }) => {
                   <span class="live-dot inline-block h-1.5 w-1.5 rounded-full bg-teal-400" />
                   {data.source === 'simulated'
                     ? 'Simulated Data'
+                    : data.source === 'local-usb'
+                      ? 'Live Data — Local USB'
                     : data.source === 'no-data'
-                      ? 'Actual Data — Waiting for readings'
+                      ? data.mode === 'local'
+                        ? 'Local USB — Waiting for readings'
+                        : 'Actual Data — Waiting for readings'
                       : 'Actual Data — Cloudflare D1'}
                 </div>
                 <p data-updated-at class="text-[11px] text-slate-500">
@@ -1523,7 +1692,7 @@ const Dashboard: FC<{ data: DashboardPayload }> = ({ data }) => {
               />
               <MetricCard
                 id="climate"
-                title="Temperature & Humidity"
+                title="Temperature, Humidity & Pressure"
                 value={hasData ? `${telemetry.temperatureC.toFixed(1)}°C` : '—'}
                 unit={hasData ? `/ ${telemetry.humidityPct}%` : ''}
                 subtitle={metrics.climate.subtitle}
@@ -1532,6 +1701,7 @@ const Dashboard: FC<{ data: DashboardPayload }> = ({ data }) => {
                 icon={<IconThermo />}
                 trend={trends.temperatureC}
                 trendLabel="Temp"
+                detail={<PressureSummary pressureHpa={telemetry.pressureHpa} />}
               />
               <MetricCard
                 id="noise"
