@@ -20,6 +20,9 @@ type Telemetry = {
   zone: ZoneId
   uvIndex: number
   co2Ppm: number
+  mq2Adc: number | null
+  mq2Voltage: number | null
+  mq2SignalPct: number | null
   temperatureC: number
   humidityPct: number
   pressureHpa: number | null
@@ -64,6 +67,7 @@ type PressureInfo = {
 type MetricTrends = {
   uvIndex: number[]
   co2Ppm: number[]
+  mq2Voltage: number[]
   temperatureC: number[]
   humidityPct: number[]
   noiseDb: number[]
@@ -79,6 +83,7 @@ type DashboardPayload = {
   available?: {
     uv: boolean
     air: boolean
+    mq2: boolean
     climate: boolean
     noise: boolean
     pressure?: boolean
@@ -91,6 +96,7 @@ type DashboardPayload = {
   metrics: {
     uv: MetricMeta
     co2: MetricMeta
+    mq2: MetricMeta
     climate: MetricMeta
     noise: MetricMeta
   }
@@ -105,6 +111,8 @@ type ReadingRow = {
   aht20_humidity_pct: number | null
   bmp280_temperature_c: number | null
   bmp280_pressure_hpa: number | null
+  mq2_adc: number | null
+  mq2_voltage: number | null
   mq135_adc: number | null
   sound_adc: number | null
   uv_index: number | null
@@ -191,6 +199,9 @@ function generateMockTelemetry(zone: ZoneId): Telemetry {
       ? clamp(jitter(base.uvIndex, 1.4, 1), 0, 14)
       : clamp(jitter(base.uvIndex, 0.15, 1), 0, 2),
     co2Ppm: Math.round(clamp(jitter(base.co2Ppm, isOutdoor ? 4 : 8, 0), 0, 100)),
+    mq2Adc: Math.round(clamp(jitter(1400, 120, 0), 0, 4095)),
+    mq2Voltage: clamp(jitter(1.15, 0.08, 2), 0, 3.3),
+    mq2SignalPct: Math.round(clamp(jitter(34, 4, 0), 0, 100)),
     temperatureC: clamp(jitter(base.temperatureC, 0.8, 1), 22, 36),
     humidityPct: Math.round(clamp(jitter(base.humidityPct, 4, 0), 40, 95)),
     pressureHpa: jitter(1012, 2, 1),
@@ -418,7 +429,40 @@ function adcToAirQualityScore(adc: number): number {
 }
 
 function adcToSoundActivity(adc: number): number {
+  // Firmware stores peak-to-peak amplitude over a 250 ms sample window.
+  // 600 ADC counts is treated as full-scale classroom activity for display.
+  return Math.round(clamp((adc / 600) * 100, 0, 100))
+}
+
+function mq2SignalPercent(adc: number): number {
   return Math.round(clamp((adc / 4095) * 100, 0, 100))
+}
+
+function mq2SignalMeta(adc: number | null, voltage: number | null): MetricMeta {
+  if (adc === null || voltage === null) {
+    return {
+      label: 'Unavailable',
+      status: 'good',
+      badge: 'N/A',
+      subtitle: 'MQ-2 sensor not enabled',
+    }
+  }
+  const percent = mq2SignalPercent(adc)
+  const label =
+    percent >= 98
+      ? 'Saturated'
+      : percent >= 70
+        ? 'High signal'
+        : percent >= 40
+          ? 'Moderate signal'
+          : 'Low signal'
+  const elevated = percent >= 70
+  return {
+    label,
+    status: elevated ? 'watch' : 'good',
+    badge: label,
+    subtitle: `${voltage.toFixed(2)} V · uncalibrated signal`,
+  }
 }
 
 function readingToTelemetry(row: ReadingRow, zoneId: ZoneId): Telemetry {
@@ -428,6 +472,9 @@ function readingToTelemetry(row: ReadingRow, zoneId: ZoneId): Telemetry {
     uvIndex: row.uv_index ?? fallback.uvIndex,
     co2Ppm:
       row.mq135_adc === null ? fallback.co2Ppm : adcToAirQualityScore(row.mq135_adc),
+    mq2Adc: row.mq2_adc,
+    mq2Voltage: row.mq2_voltage,
+    mq2SignalPct: row.mq2_adc === null ? null : mq2SignalPercent(row.mq2_adc),
     temperatureC:
       row.aht20_temperature_c ?? row.bmp280_temperature_c ?? fallback.temperatureC,
     humidityPct: row.aht20_humidity_pct ?? fallback.humidityPct,
@@ -466,7 +513,7 @@ async function getZoneReadings(db: D1Database, zoneId: ZoneId): Promise<ReadingR
       `SELECT device_id, zone, recorded_at,
         aht20_temperature_c, aht20_humidity_pct, bmp280_temperature_c,
         bmp280_pressure_hpa,
-        mq135_adc, sound_adc, uv_index
+        mq2_adc, mq2_voltage, mq135_adc, sound_adc, uv_index
        FROM readings
        WHERE zone = ?
        ORDER BY recorded_at DESC, id DESC
@@ -494,6 +541,9 @@ async function buildDashboardPayload(
             zone: zone.id,
             uvIndex: 0,
             co2Ppm: 0,
+            mq2Adc: null,
+            mq2Voltage: null,
+            mq2SignalPct: null,
             temperatureC: 0,
             humidityPct: 0,
             pressureHpa: null,
@@ -512,12 +562,17 @@ async function buildDashboardPayload(
   const fallbackTrends: MetricTrends = source === 'no-data' ? {
     uvIndex: [],
     co2Ppm: [],
+    mq2Voltage: [],
     temperatureC: [],
     humidityPct: [],
     noiseDb: [],
   } : {
     uvIndex: generateTrend(telemetry.uvIndex, isOutdoor ? 0.45 : 0.05, 1, 0, isOutdoor ? 14 : 2),
     co2Ppm: generateTrend(telemetry.co2Ppm, isOutdoor ? 3 : 6, 0, 0, 100),
+    mq2Voltage:
+      telemetry.mq2Voltage === null
+        ? []
+        : generateTrend(telemetry.mq2Voltage, 0.08, 2, 0, 3.3),
     temperatureC: generateTrend(telemetry.temperatureC, 0.35, 1, 22, 36),
     humidityPct: generateTrend(telemetry.humidityPct, 2, 0, 40, 95),
     noiseDb: generateTrend(telemetry.noiseDb, 5, 0, 0, 100),
@@ -528,6 +583,11 @@ async function buildDashboardPayload(
       zoneRows,
       (row) => (row.mq135_adc === null ? null : adcToAirQualityScore(row.mq135_adc)),
       fallbackTrends.co2Ppm,
+    ),
+    mq2Voltage: readingSeries(
+      zoneRows,
+      (row) => row.mq2_voltage,
+      fallbackTrends.mq2Voltage,
     ),
     temperatureC: readingSeries(
       zoneRows,
@@ -624,6 +684,7 @@ async function buildDashboardPayload(
 
   const uv = uvLabel(telemetry.uvIndex)
   const co2 = co2Label(telemetry.co2Ppm)
+  const mq2 = mq2SignalMeta(telemetry.mq2Adc, telemetry.mq2Voltage)
   const climate = climateLabel(telemetry.temperatureC, telemetry.humidityPct)
   const noise = noiseLabel(telemetry.noiseDb)
   const advisory =
@@ -660,6 +721,7 @@ async function buildDashboardPayload(
         badge: co2.label,
         subtitle: `${co2.label} air quality · display score`,
       },
+      mq2,
       climate: {
         label: climate.label,
         status: climate.status,
@@ -1204,6 +1266,7 @@ const clientScript = `
     histories = {
       uvIndex: trends.uvIndex.slice(),
       co2Ppm: trends.co2Ppm.slice(),
+      mq2Voltage: (trends.mq2Voltage || []).slice(),
       temperatureC: trends.temperatureC.slice(),
       humidityPct: trends.humidityPct.slice(),
       noiseDb: trends.noiseDb.slice()
@@ -1377,13 +1440,16 @@ const clientScript = `
     updateAdvisory(data.advisory, data.zone.label);
 
     var noData = data.source === 'no-data';
-    var available = data.available || { uv: true, air: true, climate: true, noise: true };
+    var available = data.available || { uv: true, air: true, mq2: true, climate: true, noise: true };
     var hasUv = !noData && available.uv;
     var hasAir = !noData && available.air;
+    var hasMq2 = !noData && available.mq2 !== false && data.telemetry.mq2Voltage != null;
+    var hasMq2Signal = hasMq2 && data.telemetry.mq2SignalPct != null;
     var hasClimate = !noData && available.climate;
     var hasNoise = !noData && available.noise;
     updateMetricCard('uv', hasUv ? data.telemetry.uvIndex.toFixed(1) : '—', '', data.metrics.uv, 'uvIndex', data.telemetry.uvIndex, append && hasUv);
     updateMetricCard('co2', hasAir ? String(data.telemetry.co2Ppm) : '—', hasAir ? '/100' : '', data.metrics.co2, 'co2Ppm', data.telemetry.co2Ppm, append && hasAir);
+    updateMetricCard('mq2', hasMq2Signal ? String(data.telemetry.mq2SignalPct) : '—', hasMq2Signal ? '%' : '', data.metrics.mq2, 'mq2Voltage', data.telemetry.mq2Voltage || 0, append && hasMq2);
     updateMetricCard(
       'climate',
       hasClimate ? data.telemetry.temperatureC.toFixed(1) + '°C' : '—',
@@ -1489,7 +1555,7 @@ const clientScript = `
     var boot = JSON.parse(document.getElementById('dashboard-bootstrap').textContent);
     seedHistories(boot.trends);
   } catch (e) {
-    histories = { uvIndex: [], co2Ppm: [], temperatureC: [], humidityPct: [], noiseDb: [] };
+    histories = { uvIndex: [], co2Ppm: [], mq2Voltage: [], temperatureC: [], humidityPct: [], noiseDb: [] };
   }
 
   schedule();
@@ -1714,7 +1780,7 @@ const Dashboard: FC<{ data: DashboardPayload }> = ({ data }) => {
               </section>
             </div>
 
-            <section class="grid min-h-0 grid-cols-2 gap-2 xl:grid-cols-4">
+            <section class="grid min-h-0 grid-cols-2 gap-2 xl:grid-cols-5">
               <MetricCard
                 id="uv"
                 title="Outdoor UV Index"
@@ -1737,6 +1803,22 @@ const Dashboard: FC<{ data: DashboardPayload }> = ({ data }) => {
                 icon={<IconAir />}
                 trend={trends.co2Ppm}
                 trendLabel="Air quality"
+              />
+              <MetricCard
+                id="mq2"
+                title="Smoke / Gas Signal"
+                value={
+                  hasData && telemetry.mq2SignalPct !== null
+                    ? String(telemetry.mq2SignalPct)
+                    : '—'
+                }
+                unit={hasData && telemetry.mq2SignalPct !== null ? '%' : ''}
+                subtitle={metrics.mq2.subtitle}
+                badge={metrics.mq2.badge}
+                status={metrics.mq2.status}
+                icon={<IconAir />}
+                trend={trends.mq2Voltage}
+                trendLabel="MQ-2 signal"
               />
               <MetricCard
                 id="climate"

@@ -12,13 +12,27 @@ const BRIDGE_PORT = Number(process.env.BRIDGE_PORT || 8788)
 const DASHBOARD_PORT = Number(process.env.DASHBOARD_PORT || 8787)
 const SERIAL_BAUD = Number(process.env.SERIAL_BAUD || 115200)
 const HISTORY_LIMIT = 12
+const MQ2_CALIBRATION_SAMPLES = 10
+const SOUND_CALIBRATION_SAMPLES = 10
+const SOUND_AVERAGE_SAMPLES = 10
+const SOUND_ACTIVITY_RANGE_ADC = 600
 
 let serial
 let dashboard
 let latest = null
+let mq2BaselineAdc = null
+const mq2Calibration = []
+let soundBaselineAdc =
+  process.env.SOUND_BASELINE_ADC && Number.isFinite(Number(process.env.SOUND_BASELINE_ADC))
+    ? Number(process.env.SOUND_BASELINE_ADC)
+    : null
+const soundCalibration = []
+const soundActivitySamples = []
 let serialPath = process.env.SERIAL_PORT || ''
 let lineBuffer = ''
 const history = {
+  mq2Voltage: [],
+  noiseDb: [],
   temperatureC: [],
   humidityPct: [],
 }
@@ -27,6 +41,18 @@ function appendHistory(key, value) {
   if (!Number.isFinite(value)) return
   history[key].push(value)
   if (history[key].length > HISTORY_LIMIT) history[key].shift()
+}
+
+function soundActivityFor(adc) {
+  return Math.round(
+    Math.max(0, Math.min(100, ((adc - soundBaselineAdc) / SOUND_ACTIVITY_RANGE_ADC) * 100)),
+  )
+}
+
+function average(values) {
+  return values.length
+    ? Math.round(values.reduce((sum, value) => sum + value, 0) / values.length)
+    : 0
 }
 
 function acceptReading(reading) {
@@ -39,10 +65,39 @@ function acceptReading(reading) {
     latest.aht20_temperature_c ?? latest.bmp280_temperature_c,
   )
   appendHistory('humidityPct', latest.aht20_humidity_pct)
+  appendHistory('mq2Voltage', latest.mq2_voltage)
+  if (mq2BaselineAdc === null && Number.isFinite(latest.mq2_adc)) {
+    mq2Calibration.push(latest.mq2_adc)
+    if (mq2Calibration.length >= MQ2_CALIBRATION_SAMPLES) {
+      const sorted = mq2Calibration.slice().sort((a, b) => a - b)
+      const trimmed = sorted.slice(1, -1)
+      mq2BaselineAdc = Math.round(trimmed.reduce((sum, value) => sum + value, 0) / trimmed.length)
+      console.log(`[sensor] MQ-2 ambient baseline calibrated at ADC ${mq2BaselineAdc}`)
+    }
+  }
+  if (soundBaselineAdc === null && Number.isFinite(latest.sound_adc)) {
+    soundCalibration.push(latest.sound_adc)
+    if (soundCalibration.length >= SOUND_CALIBRATION_SAMPLES) {
+      const sorted = soundCalibration.slice().sort((a, b) => a - b)
+      const trimmed = sorted.slice(1, -1)
+      soundBaselineAdc = Math.round(
+        trimmed.reduce((sum, value) => sum + value, 0) / trimmed.length,
+      )
+      console.log(`[sensor] Sound ambient baseline calibrated at amplitude ${soundBaselineAdc}`)
+    }
+  }
+  if (soundBaselineAdc !== null && Number.isFinite(latest.sound_adc)) {
+    soundActivitySamples.push(soundActivityFor(latest.sound_adc))
+    if (soundActivitySamples.length > SOUND_AVERAGE_SAMPLES) soundActivitySamples.shift()
+    appendHistory('noiseDb', average(soundActivitySamples))
+  }
   console.log(
     `[sensor] ${latest.recorded_at}  ` +
       `AHT20 ${latest.aht20_temperature_c ?? '—'}°C / ${latest.aht20_humidity_pct ?? '—'}%  ` +
-      `BMP280 ${latest.bmp280_pressure_hpa ?? '—'} hPa`,
+      `BMP280 ${latest.bmp280_pressure_hpa ?? '—'} hPa  ` +
+      `MQ-2 ${latest.mq2_voltage ?? '—'} V  ` +
+      `Sound amplitude ${latest.sound_adc ?? '—'} ADC / ${latest.sound_voltage ?? '—'} V  ` +
+      `DO ${latest.sound_detected == null ? '—' : latest.sound_detected ? 'detected' : 'quiet'}`,
   )
 }
 
@@ -120,7 +175,10 @@ async function connectSerial() {
     serialPath = await chooseSerialPort()
     serial = new SerialPort({ path: serialPath, baudRate: SERIAL_BAUD })
     serial.on('data', consumeSerial)
-    serial.on('open', () => console.log(`[serial] Connected to ${serialPath} at ${SERIAL_BAUD}`))
+    serial.on('open', () => {
+      serial.set({ dtr: false, rts: false })
+      console.log(`[serial] Connected to ${serialPath} at ${SERIAL_BAUD}`)
+    })
     serial.on('error', (error) => console.error('[serial]', error.message))
     serial.on('close', () => {
       console.warn('[serial] Disconnected; retrying in 2 seconds')
@@ -164,6 +222,16 @@ function statusForClimate(temperatureC, humidityPct) {
   return ['good', 'Stable']
 }
 
+function mq2SignalInfo(adc, baseline) {
+  if (baseline === null) return null
+  const headroom = Math.max(1, 4095 - baseline)
+  const percent = Math.round(Math.max(0, Math.min(100, ((adc - baseline) / headroom) * 100)))
+  if (percent >= 60) return { percent, label: 'High increase', status: 'watch' }
+  if (percent >= 30) return { percent, label: 'Elevated', status: 'watch' }
+  if (percent >= 10) return { percent, label: 'Slight increase', status: 'good' }
+  return { percent, label: 'Ambient baseline', status: 'good' }
+}
+
 function buildPayload() {
   const hasReading = latest !== null
   const temperatureC =
@@ -171,6 +239,24 @@ function buildPayload() {
   const humidityPct = latest?.aht20_humidity_pct ?? 0
   const hasClimate = hasReading && Number.isFinite(temperatureC) && Number.isFinite(humidityPct)
   const [climateStatus, climateLabel] = statusForClimate(temperatureC, humidityPct)
+  const mq2Adc = latest?.mq2_adc ?? null
+  const mq2Voltage = latest?.mq2_voltage ?? null
+  const mq2Available = Number.isFinite(mq2Adc) && Number.isFinite(mq2Voltage)
+  const mq2 = mq2Available ? mq2SignalInfo(mq2Adc, mq2BaselineAdc) : null
+  const soundAvailable = Number.isFinite(latest?.sound_adc)
+  const soundActivity =
+    soundAvailable && soundBaselineAdc !== null
+      ? average(soundActivitySamples)
+      : 0
+  const soundStatus = soundActivity >= 75 ? 'alert' : soundActivity >= 50 ? 'watch' : 'good'
+  const soundLabel =
+    soundActivity >= 75
+      ? 'Too loud'
+      : soundActivity >= 50
+        ? 'Loud'
+        : soundActivity >= 20
+          ? 'Active'
+          : 'Quiet'
   const updatedAt = latest?.recorded_at || new Date().toISOString()
   const zone = resolveZone(latest?.zone)
 
@@ -183,13 +269,15 @@ function buildPayload() {
         latest?.mq135_adc == null
           ? 0
           : Math.round(Math.max(0, Math.min(100, 100 - (latest.mq135_adc / 4095) * 100))),
+      mq2Adc,
+      mq2Voltage,
+      mq2SignalPct: mq2?.percent ?? null,
+      mq2BaselineAdc,
       temperatureC,
       humidityPct,
       pressureHpa: latest?.bmp280_pressure_hpa ?? null,
       noiseDb:
-        latest?.sound_adc == null
-          ? 0
-          : Math.round(Math.max(0, Math.min(100, (latest.sound_adc / 4095) * 100))),
+        soundActivity,
       updatedAt,
     },
     mode: 'local',
@@ -197,8 +285,9 @@ function buildPayload() {
     available: {
       uv: latest?.uv_index != null,
       air: latest?.mq135_adc != null,
+      mq2: mq2Available,
       climate: hasClimate,
-      noise: latest?.sound_adc != null,
+      noise: soundAvailable,
       pressure: latest?.bmp280_pressure_hpa != null,
       altitude: latest?.bmp280_altitude_m != null,
     },
@@ -206,9 +295,10 @@ function buildPayload() {
     trends: {
       uvIndex: [],
       co2Ppm: [],
+      mq2Voltage: history.mq2Voltage,
       temperatureC: history.temperatureC,
       humidityPct: history.humidityPct,
-      noiseDb: [],
+      noiseDb: history.noiseDb,
     },
     hourly: [],
     snapshots: [
@@ -224,8 +314,21 @@ function buildPayload() {
         statusLabel: hasReading ? climateLabel : 'Waiting for USB',
       },
     ],
-    advisory: hasReading
-      ? {
+    advisory:
+      soundBaselineAdc !== null && soundActivity >= 75
+        ? {
+            level: 'alert',
+            title: 'Classroom noise is too loud',
+            message: `Noise activity is ${soundActivity}% above the room baseline. Lower voices or reduce the sound source.`,
+          }
+        : soundBaselineAdc !== null && soundActivity >= 50
+          ? {
+              level: 'watch',
+              title: 'Classroom noise is rising',
+              message: `Noise activity is ${soundActivity}% above the room baseline. Consider reducing the volume.`,
+            }
+          : hasReading
+            ? {
           level: climateStatus,
           title: 'USB sensors connected',
           message:
@@ -233,8 +336,8 @@ function buildPayload() {
             (latest?.bmp280_pressure_hpa == null
               ? ''
               : ` · BMP280: ${latest.bmp280_pressure_hpa.toFixed(1)} hPa`),
-        }
-      : {
+              }
+            : {
           level: 'good',
           title: 'Waiting for USB sensor data',
           message: `Connected bridge is waiting for [DATA] readings from ${serialPath || 'the ESP32'}.`,
@@ -247,6 +350,26 @@ function buildPayload() {
         badge: 'N/A',
         subtitle: 'Air-quality sensor not enabled',
       },
+      mq2: mq2Available
+        ? mq2
+          ? {
+            label: mq2.label,
+            status: mq2.status,
+            badge: mq2.label,
+            subtitle: `${mq2Voltage.toFixed(2)} V · baseline ADC ${mq2BaselineAdc}`,
+          }
+          : {
+              label: 'Calibrating',
+              status: 'good',
+              badge: `${mq2Calibration.length}/${MQ2_CALIBRATION_SAMPLES}`,
+              subtitle: 'Keep air stable for ambient baseline',
+            }
+        : {
+            label: 'Unavailable',
+            status: 'good',
+            badge: 'N/A',
+            subtitle: 'MQ-2 sensor not enabled',
+          },
       climate: {
         label: climateLabel,
         status: climateStatus,
@@ -254,10 +377,25 @@ function buildPayload() {
         subtitle: hasClimate ? climateLabel : 'Waiting for AHT20',
       },
       noise: {
-        label: 'Unavailable',
-        status: 'good',
-        badge: 'N/A',
-        subtitle: 'Sound sensor not enabled',
+        label:
+          !soundAvailable
+            ? 'Unavailable'
+            : soundBaselineAdc === null
+              ? 'Calibrating'
+              : soundLabel,
+        status: soundAvailable && soundBaselineAdc !== null ? soundStatus : 'good',
+        badge:
+          !soundAvailable
+            ? 'N/A'
+            : soundBaselineAdc === null
+              ? `${soundCalibration.length}/${SOUND_CALIBRATION_SAMPLES}`
+              : soundLabel,
+        subtitle:
+          !soundAvailable
+            ? 'Sound sensor not enabled'
+            : soundBaselineAdc === null
+              ? 'Keep room at its normal quiet level'
+              : `10-sample average · ambient ${soundBaselineAdc}`,
       },
     },
     updatedAtFormatted: new Intl.DateTimeFormat('en-MV', {

@@ -42,11 +42,11 @@ const unsigned long sample_interval_ms = 3000;
 #define PIN_UV 33
 
 // Flip these to true after each module is wired. Unconnected ADC pins store noise.
-const bool enable_mq2 = false;
+const bool enable_mq2 = true;
 const bool enable_mq4 = false;
 const bool enable_mq6 = false;
 const bool enable_mq135 = false;
-const bool enable_sound = false;
+const bool enable_sound = true;
 const bool enable_uv = false;
 
 // GUVA-S12SD modules are commonly ~0.1 V per UV index.
@@ -111,6 +111,22 @@ bool readAnalog(int pin, int& adc, float& voltage) {
   adc = analogRead(pin);
   voltage = analogReadMilliVolts(pin) / 1000.0f;
   return true;
+}
+
+void readSoundActivity(int& amplitude_adc, float& amplitude_voltage, int& detected) {
+  int minimum = 4095;
+  int maximum = 0;
+  detected = 0;
+  const unsigned long started = millis();
+  while (millis() - started < 250) {
+    const int sample = analogRead(PIN_SOUND_AO);
+    minimum = min(minimum, sample);
+    maximum = max(maximum, sample);
+    if (digitalRead(PIN_SOUND_DO) == LOW) detected = 1;
+    delayMicroseconds(200);
+  }
+  amplitude_adc = maximum - minimum;
+  amplitude_voltage = amplitude_adc * 3.3f / 4095.0f;
 }
 
 String hardwareDeviceId() {
@@ -255,8 +271,7 @@ void loop() {
     if (enable_mq6) readAnalog(PIN_MQ6, mq6_adc, mq6_v);
     if (enable_mq135) readAnalog(PIN_MQ135, mq135_adc, mq135_v);
     if (enable_sound) {
-      readAnalog(PIN_SOUND_AO, sound_adc, sound_v);
-      sound_detected = digitalRead(PIN_SOUND_DO) == LOW ? 1 : 0;
+      readSoundActivity(sound_adc, sound_v, sound_detected);
     }
     if (enable_uv) {
       readAnalog(PIN_UV, uv_adc, uv_v);
@@ -277,7 +292,7 @@ void loop() {
     if (enable_mq4) Serial.printf("MQ-4  (CH4):       adc=%d  %.3f V\n", mq4_adc, mq4_v);
     if (enable_mq6) Serial.printf("MQ-6  (LPG):       adc=%d  %.3f V\n", mq6_adc, mq6_v);
     if (enable_mq135) Serial.printf("MQ-135 (air):      adc=%d  %.3f V\n", mq135_adc, mq135_v);
-    if (enable_sound) Serial.printf("Sound XD-74:       adc=%d  %.3f V  detected=%d\n", sound_adc, sound_v, sound_detected);
+    if (enable_sound) Serial.printf("Sound XD-74:       peak-to-peak=%d  %.3f V  DO_detected=%d\n", sound_adc, sound_v, sound_detected);
     if (enable_uv) Serial.printf("UV GUVA-S12SD:     adc=%d  %.3f V  index≈%.2f\n", uv_adc, uv_v, uv_index);
     Serial.println("-------------------------------------");
 
